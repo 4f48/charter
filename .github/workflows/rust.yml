@@ -66,15 +66,10 @@ jobs:
             !target/${{ matrix.target }}/release/.fingerprint
       - name: List directory structure
         run: tree
-      - name: Linux build provenance
+      - name: Provenance
         uses: actions/attest-build-provenance@v2
-        if: runner.os == 'Linux'
         with:
           subject-path: |
-            ${{ github.workspace }}target/${{ matrix.target }}/release/charter
-      - name: Windows build provenance
-        uses: actions/attest-build-provenance@v2
-        if: runner.os == 'Windows'
-        with:
-          subject-path: |
-            ${{ github.workspace }}target/${{ matrix.target }}/release/charter.exe
+            ${{ github.workspace }}/target/${{ matrix.target }}/release/charter*
+            !${{ github.workspace }}/target/${{ matrix.target }}/release/charter.d
+            !${{ github.workspace }}/target/${{ matrix.target }}/release/charter.pdb
