@@ -6,12 +6,6 @@ on:
   pull_request:
     branches: [ "main" ]
 
-permissions:
-  contents: read
-  id-token: write
-  actions: read
-  security-events: write
-
 env:
   CARGO_TERM_COLOR: always
 
@@ -33,6 +27,9 @@ jobs:
   build:
     name: Build
     needs: check
+    permissions:
+      id-token: write
+      attestations: write
     strategy:
       matrix:
         include:
@@ -70,18 +67,5 @@ jobs:
             !target/${{ matrix.target }}/release/.fingerprint
       - name: Provenance
         uses: actions/attest-build-provenance@v2
-        with:
-          subject-path: target/release/charter*
-  provenance:
-    name: Provenance
-    needs: [build]
-    permissions:
-      actions: read
-      id-token: write
-      contents:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Generate provenance
-        uses: actions/attest-build-provenance@v1
         with:
           subject-path: target/release/charter*
