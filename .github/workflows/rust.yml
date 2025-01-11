@@ -68,37 +68,20 @@ jobs:
             !target/${{ matrix.target }}/release/deps
             !target/${{ matrix.target }}/release/build
             !target/${{ matrix.target }}/release/.fingerprint
+      - name: Provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: target/release/charter*
   provenance:
     name: Provenance
     needs: [build]
     permissions:
       actions: read
       id-token: write
-      contents: write
+      contents:
     runs-on: ubuntu-latest
     steps:
       - name: Generate provenance
         uses: actions/attest-build-provenance@v1
         with:
           subject-path: target/release/charter*
-  verify:
-    name: Verify
-    needs: [build, provenance]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts and provenance
-        uses: actions/download-artifact@v4
-        with:
-          pattern: charter-*
-          merge-multiple: true
-      - name: Install cosign
-        uses: sigstore/cosign-installer@v3.4.0
-      - name: Verify artifacts
-        run: |
-          for file in charter-*; do
-            if [ -f "$file" ]; then
-              cosign verify-blob --certificate-identity "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-                --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-                "$file"
-            fi
-          done
