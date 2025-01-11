@@ -70,5 +70,6 @@ jobs:
         uses: actions/attest-build-provenance@v2
         with:
           subject-path: |
-            ${{ github.workspace }}target/${{ matrix.target }}/release/charter
-            ${{ github.workspace }}target/${{ matrix.target }}/release/charter.exe
+            ${{ github.workspace }}target/${{ matrix.target }}/release/charter*
+            !${{ github.workspace }}target/${{ matrix.target }}/release/charter.d
+            !${{ github.workspace }}target/${{ matrix.target }}/release/charter.pdb
