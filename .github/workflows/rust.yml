@@ -71,13 +71,6 @@ jobs:
   provenance:
     name: Provenance
     needs: [build]
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            artifact_name: linux-x86_64
-          - os: windows-latest
-            artifact_name: msvc-x86_64
     permissions:
       actions: read
       id-token: write
@@ -87,7 +80,7 @@ jobs:
       - name: Generate provenance
         uses: actions/attest-build-provenance@v1
         with:
-          subject-path: target/release/charter-${{ matrix.artifact_name }}
+          subject-path: target/release/charter*
   verify:
     name: Verify
     needs: [build, provenance]
