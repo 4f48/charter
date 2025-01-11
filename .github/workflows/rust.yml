@@ -64,8 +64,6 @@ jobs:
             !target/${{ matrix.target }}/release/deps
             !target/${{ matrix.target }}/release/build
             !target/${{ matrix.target }}/release/.fingerprint
-      - name: List directory structure
-        run: tree
       - name: Provenance
         uses: actions/attest-build-provenance@v2
         with:
