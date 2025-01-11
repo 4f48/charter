@@ -69,6 +69,4 @@ jobs:
         uses: actions/attest-build-provenance@v2
         if: runner.os == 'Linux'
         with:
-          subject-path: |
-            target/release/charter
-            target/release/charter.exe
+          subject-path: ${{ github.workspace }}/target/release/charter*
