@@ -60,7 +60,6 @@ jobs:
           name: charter-${{ matrix.artifact_name }}
           path: |
             target/${{ matrix.target }}/release/*.exe
-            target/${{ matrix.target }}/release/*.dll
             target/${{ matrix.target }}/release/*
             !target/${{ matrix.target }}/release/deps
             !target/${{ matrix.target }}/release/build
@@ -69,6 +68,7 @@ jobs:
         run: tree
       - name: Provenance
         uses: actions/attest-build-provenance@v2
-        if: runner.os == 'Linux'
         with:
-          subject-path: ./target/${{ matrix.target }}/release/charter*
+          subject-path: |
+            ${{ github.workspace }}target/${{ matrix.target }}/release/charter
+            ${{ github.workspace }}target/${{ matrix.target }}/release/charter.exe
