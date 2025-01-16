@@ -1,27 +1,39 @@
 use clap::Parser;
+use csv::Writer;
 use serialport::{DataBits, Parity, SerialPort, StopBits};
 use std::backtrace;
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write};
-use std::io::{ErrorKind, Read, Write as IoWrite};
+use std::fs::File;
+use std::io::{BufWriter, ErrorKind, Read, Write as IoWrite};
+use std::path::PathBuf;
 use std::process::exit;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, Level};
+use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
 struct Args {
+    /// Serial port assigned to LoRa receiver
     port: String,
     #[arg(short, long)]
+    /// Log debug information
     debug: bool,
+    #[arg(short, long)]
+    /// CSV file name to print data to
+    output: Option<PathBuf>,
+    #[arg(short, long)]
+    /// Allow the creation of a new CSV file
+    create: bool,
 }
 
 fn main() {
     let args = Args::parse();
 
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+    let subscriber = FmtSubscriber::builder()
         .with_max_level(if args.debug {
             Level::TRACE
         } else {
@@ -77,7 +89,32 @@ fn main() {
                     match get_data(line) {
                         Ok(data) => {
                             if let Ok(data) = parse_data(data) {
-                                debug!("{index}: {data:?}");
+                                match args.output {
+                                    Some(ref output) => {
+                                        match write_csv(&data, output, args.create) {
+                                            Ok(_) => debug!(
+                                                "Written {:?} to {} ({})",
+                                                &data,
+                                                &output.display(),
+                                                index
+                                            ),
+                                            Err(error) => {
+                                                if let Some(io_error) =
+                                                    error.downcast_ref::<std::io::Error>()
+                                                {
+                                                    match io_error.kind() {
+                                                        ErrorKind::NotFound => panic!("{error}"),
+                                                        _ => error!("{error}"),
+                                                    }
+                                                } else {
+                                                    error!("{error}");
+                                                }
+                                            }
+                                        };
+                                    }
+                                    None => info!("{index}: {data:?}"),
+                                }
+
                                 index += 1;
                             };
                         }
@@ -141,10 +178,23 @@ fn get_data(line: String) -> Result<String, Box<dyn Error>> {
     Ok(String::from_utf8(hex::decode(data)?)?)
 }
 
-fn parse_data(line: String) -> Result<[usize; 11], Box<dyn Error>> {
-    let mut data: [usize; 11] = [0; 11];
+fn parse_data(line: String) -> Result<[String; 11], Box<dyn Error>> {
+    let mut data: [String; 11] = [const { String::new() }; 11];
     for (index, item) in line.split_whitespace().take(11).enumerate() {
-        data[index] = item.parse()?;
+        data[index] = item.to_string();
     }
     Ok(data)
+}
+
+fn write_csv(data: &[String; 11], path: &PathBuf, create: bool) -> Result<(), Box<dyn Error>> {
+    let file = std::fs::OpenOptions::new()
+        .append(true)
+        .create(create)
+        .open(path)?;
+
+    let buf_writer = BufWriter::new(file);
+    let mut writer = Writer::from_writer(buf_writer);
+    writer.write_record(data)?;
+    writer.flush()?;
+    Ok(())
 }
