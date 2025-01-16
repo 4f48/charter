@@ -5,7 +5,6 @@ use std::backtrace;
 use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write};
-use std::fs::File;
 use std::io::{BufWriter, ErrorKind, Read, Write as IoWrite};
 use std::path::PathBuf;
 use std::process::exit;
