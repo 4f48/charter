@@ -1,6 +1,7 @@
 use clap::Parser;
-use plotters::prelude::*;
 use serialport::{DataBits, Parity, SerialPort, StopBits};
+use std::backtrace;
+use std::backtrace::Backtrace;
 use std::error::Error;
 use std::fmt::{Display, Formatter, Write};
 use std::io::{ErrorKind, Read, Write as IoWrite};
@@ -8,14 +9,37 @@ use std::process::exit;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
+use tracing::{debug, error, info, Level};
 
 #[derive(Parser)]
 struct Args {
     port: String,
+    #[arg(short, long)]
+    debug: bool,
 }
 
 fn main() {
     let args = Args::parse();
+
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(if args.debug {
+            Level::TRACE
+        } else {
+            Level::INFO
+        })
+        .finish();
+    tracing::subscriber::set_global_default(subscriber).unwrap();
+
+    std::panic::set_hook(Box::new(|panic| {
+        let trace = Backtrace::capture();
+        if trace.status() == backtrace::BacktraceStatus::Disabled {
+            error!("{panic}");
+        } else {
+            error!("{panic} {trace}");
+        }
+        exit(1);
+    }));
+
     let mut serial = serialport::new(&args.port, 115200)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
@@ -28,7 +52,7 @@ fn main() {
     let r = running.clone();
     let mut serial_clone = serial.try_clone().unwrap();
     ctrlc::set_handler(move || {
-        serial_end(&mut serial_clone);
+        serial_end(&mut serial_clone).unwrap();
         r.store(false, std::sync::atomic::Ordering::SeqCst);
     })
     .expect("Failed to set Ctrl-C handler");
@@ -39,7 +63,13 @@ fn main() {
     while running.load(std::sync::atomic::Ordering::SeqCst) {
         match serial.read(serial_buf.as_mut_slice()) {
             Ok(n) => {
-                let str = String::from_utf8(Vec::from(&serial_buf[..n])).unwrap();
+                let str = match String::from_utf8(Vec::from(&serial_buf[..n])) {
+                    Ok(str) => str,
+                    Err(error) => {
+                        error!("{error}");
+                        continue;
+                    }
+                };
                 line_buf.write_str(&str).unwrap();
                 while let Some(pos) = line_buf.find("\r\n") {
                     let line = line_buf[..pos].trim_end().to_string();
@@ -47,11 +77,11 @@ fn main() {
                     match get_data(line) {
                         Ok(data) => {
                             if let Ok(data) = parse_data(data) {
+                                debug!("{index}: {data:?}");
                                 index += 1;
-                                create_chart(&data, format!("chart{}.svg", index));
                             };
                         }
-                        Err(error) => println!("{error}"),
+                        Err(error) => tracing::warn!("{error}"),
                     };
                 }
             }
@@ -65,14 +95,13 @@ fn main() {
 }
 
 fn serial_begin(serial: &mut Box<dyn SerialPort>) -> Result<Arc<AtomicBool>, serialport::Error> {
-    println!("Starting serial communication...");
+    info!("Starting serial communication...");
     serial.write_all("radio rx 0\r\n".as_bytes())?;
     Ok(Arc::new(AtomicBool::new(true)))
 }
 
-fn serial_end(serial: &mut Box<dyn SerialPort>) {
-    println!("Stopping Serial communication...");
-    serial.write_all("radio rxstop\r\n".as_bytes()).unwrap();
+fn serial_end(serial: &mut Box<dyn SerialPort>) -> Result<(), serialport::Error> {
+    Ok(serial.write_all("radio rxstop\r\n".as_bytes())?)
 }
 
 #[derive(Debug)]
@@ -95,6 +124,7 @@ impl Error for GetDataError {}
 fn get_data(line: String) -> Result<String, Box<dyn Error>> {
     let mut message = line.split_whitespace();
     if message.clone().count() != 2 {
+        debug!("{line}");
         return Err(Box::new(GetDataError::IrregularMessage(
             "this line doesn't contain any data",
         )));
@@ -102,9 +132,10 @@ fn get_data(line: String) -> Result<String, Box<dyn Error>> {
     let data = match message.nth(1) {
         Some(data) => data,
         None => {
+            debug!("{line}");
             return Err(Box::new(GetDataError::ParseError(
                 "failed to retrieve data",
-            )))
+            )));
         }
     };
     Ok(String::from_utf8(hex::decode(data)?)?)
@@ -116,34 +147,4 @@ fn parse_data(line: String) -> Result<[usize; 11], Box<dyn Error>> {
         data[index] = item.parse()?;
     }
     Ok(data)
-}
-
-fn create_chart(data: &[usize; 11], filename: String) {
-    let root = SVGBackend::new(filename.as_str(), (1000, 550)).into_drawing_area();
-    root.fill(&WHITE).unwrap();
-    let mut chart = ChartBuilder::on(&root)
-        .x_label_area_size(35)
-        .y_label_area_size(40)
-        .margin(5)
-        .caption("Spectrophotometer", ("sans-serif", 30.0))
-        .build_cartesian_2d(0usize..11usize, 0usize..*data.iter().max().unwrap())
-        .unwrap();
-    chart
-        .configure_mesh()
-        .disable_x_mesh()
-        .bold_line_style(WHITE.mix(0.3))
-        .y_desc("Intensity")
-        .x_desc("Channels")
-        .axis_desc_style(("sans-serif", 15))
-        .draw()
-        .unwrap();
-    chart
-        .draw_series(
-            Histogram::vertical(&chart)
-                .style(RED.mix(0.5).filled())
-                .data(data.iter().enumerate().map(|(index, item)| (index, *item)))
-                .step_by(1),
-        )
-        .unwrap();
-    root.present().unwrap();
 }
