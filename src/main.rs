@@ -4,7 +4,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio_serial::{DataBits, Parity, SerialPortBuilderExt, StopBits};
 use tracing::{error, info, Level};
 
-use futures_util::{SinkExt};
+use futures_util::SinkExt;
 use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio_tungstenite::accept_async;
@@ -14,18 +14,18 @@ use tokio_tungstenite::tungstenite::Utf8Bytes;
 struct Args {
     /// Serial port assigned to LoRa receiver
     port: String,
-    
+
     /// Print debug information
     #[arg(short, long)]
     debug: bool,
-    
+
     /// Define an output CSV file
     #[arg(short, long)]
     output: Option<String>,
-    
-    /// Broadcast data over WebSocket
+
+    /// Launch WebSocket server with address
     #[arg(short, long)]
-    websocket: bool,
+    websocket: Option<String>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -35,7 +35,6 @@ struct Data([String; 22]);
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    // Set up tracing/logging.
     let subscriber = tracing_subscriber::FmtSubscriber::builder()
         .with_max_level(if args.debug {
             Level::TRACE
@@ -45,14 +44,12 @@ async fn main() -> anyhow::Result<()> {
         .finish();
     tracing::subscriber::set_global_default(subscriber)?;
 
-    // Open the serial port.
     let mut serial = tokio_serial::new(&args.port, 115200)
         .data_bits(DataBits::Eight)
         .parity(Parity::None)
         .stop_bits(StopBits::One)
         .open_native_async()?;
 
-    // Optionally open a CSV output file.
     let mut writer = match args.output {
         Some(ref path) => Some(
             OpenOptions::new()
@@ -64,15 +61,12 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
-    // Create a broadcast channel for sending out serial data.
-    // All WebSocket clients will subscribe to this channel.
     let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
 
-    // Launch the WebSocket server in the background if the websocket flag is set.
-    if args.websocket {
+    if let Some(address) = args.websocket {
         let ws_broadcast_tx = broadcast_tx.clone();
         tokio::spawn(async move {
-            if let Err(e) = run_websocket_server(ws_broadcast_tx).await {
+            if let Err(e) = websocket(ws_broadcast_tx, &address).await {
                 error!("WebSocket server error: {}", e);
             }
         });
@@ -122,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
     tokio::select! {
         _ = process => {},
         _ = tokio::signal::ctrl_c() => {
-            info!("CTRL+C received, shutting down.");
+            info!("Shutting down...");
         }
     }
     Ok(())
@@ -157,13 +151,15 @@ async fn write_csv(writer: &mut tokio::fs::File, data: &Data) -> anyhow::Result<
     Ok(())
 }
 
-/// Launches a simple WebSocket server listening on port 9000.
+/// Launches a simple WebSocket server.
 /// For every new connection, a subscription to the broadcast channel is created;
 /// messages received on the channel are sent to the client.
-async fn run_websocket_server(broadcast_tx: broadcast::Sender<String>) -> anyhow::Result<()> {
-    let addr = "127.0.0.1:9000";
-    let listener = TcpListener::bind(addr).await?;
-    info!("WebSocket server listening on ws://{}", addr);
+async fn websocket(
+    broadcast_tx: broadcast::Sender<String>,
+    address: &String,
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(address).await?;
+    info!("WebSocket server listening on ws://{}", address);
 
     loop {
         let (stream, peer_addr) = listener.accept().await?;
