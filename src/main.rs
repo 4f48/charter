@@ -20,11 +20,16 @@ struct Args {
     debug: bool,
 
     /// Define an output CSV file
-    #[arg(short, long)]
+    #[arg(short, long, value_name = "FILE")]
     output: Option<String>,
 
-    /// Launch WebSocket server with address
-    #[arg(short, long)]
+    /// Launch WebSocket server for web panel
+    #[arg(
+        short,
+        long,
+        value_name = "ADDRESS",
+        default_missing_value = "127.0.0.1:3000"
+    )]
     websocket: Option<String>,
 }
 
@@ -71,13 +76,9 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
-
-    // Tell the serial device to start “radio rx”.
+    
     serial.write_all(b"radio rx 0\r\n").await?;
-
-    // Process incoming serial data.
-    // Each line is parsed; CSV is optionally written, and the parsed data
-    // is broadcast to all connected WebSocket clients.
+    
     let broadcast_tx_clone = broadcast_tx.clone();
     let process = tokio::spawn(async move {
         let mut reader = tokio::io::BufReader::new(&mut serial).lines();
@@ -85,14 +86,12 @@ async fn main() -> anyhow::Result<()> {
         while let Ok(Some(line)) = reader.next_line().await {
             match parse_line(&line) {
                 Ok(data) => {
-                    // If CSV output is enabled, write data.
                     if let Some(ref mut file) = writer {
                         if let Err(e) = write_csv(file, &data).await {
                             error!("CSV write error: {}", e);
                         }
                     }
-                    // If WebSocket broadcasting is enabled, send JSON.
-                    // (Even if no client is connected, broadcast_tx.send() works fine.)
+
                     if broadcast_tx_clone.receiver_count() > 0 {
                         match serde_json::to_string(&data) {
                             Ok(json_msg) => {
@@ -111,8 +110,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok::<(), anyhow::Error>(())
     });
-
-    // Wait for either the processing task to finish or a CTRL+C signal.
+    
     tokio::select! {
         _ = process => {},
         _ = tokio::signal::ctrl_c() => {
@@ -140,7 +138,7 @@ fn parse_line(line: &str) -> anyhow::Result<Data> {
     Ok(Data(data_arr))
 }
 
-/// Serializes the Data and writes it as CSV to the given file.
+/// Serializes Data and writes it as CSV to the given file.
 async fn write_csv(writer: &mut tokio::fs::File, data: &Data) -> anyhow::Result<()> {
     let mut wtr = csv::WriterBuilder::new()
         .has_headers(false)
@@ -166,19 +164,18 @@ async fn websocket(
         info!("New WebSocket connection from {}", peer_addr);
         let tx = broadcast_tx.clone();
         tokio::spawn(async move {
-            // Complete the WebSocket handshake.
-            let ws_stream = accept_async(stream).await;
-            if let Err(e) = ws_stream {
-                error!("WebSocket handshake error: {}", e);
-                return;
-            }
-            let mut ws_stream = ws_stream.unwrap();
-            // For each client, subscribe to the broadcast channel.
+            let mut ws_stream = match accept_async(stream).await {
+                Ok(ws_stream) => ws_stream,
+                Err(error) => {
+                    error!("WebSocket handshake error: {error}");
+                    return;
+                }
+            };
+            
             let mut rx = tx.subscribe();
             loop {
                 match rx.recv().await {
                     Ok(msg) => {
-                        // Send the broadcast message to the client.
                         if ws_stream
                             .send(tokio_tungstenite::tungstenite::Message::Text(
                                 Utf8Bytes::from(msg),
@@ -190,7 +187,7 @@ async fn websocket(
                             break;
                         }
                     }
-                    // Skip messages if the receiver lags behind.
+                    
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
