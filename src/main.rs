@@ -1,16 +1,19 @@
+use anyhow::bail;
 use clap::Parser;
-use tokio::fs::OpenOptions;
+use futures_util::{SinkExt, StreamExt};
+use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
-use tokio_serial::{DataBits, Parity, SerialPortBuilderExt, StopBits};
-use tracing::{error, info, Level};
-
-use futures_util::SinkExt;
-use tokio::net::TcpListener;
-use tokio::sync::broadcast;
+use tokio::net::TcpStream;
+use tokio::sync::broadcast::{Receiver, Sender};
+use tokio::sync::{broadcast, Mutex};
+use tokio_serial::{SerialPortBuilderExt, SerialStream};
 use tokio_tungstenite::accept_async;
-use tokio_tungstenite::tungstenite::Utf8Bytes;
+use tokio_tungstenite::tungstenite::Message;
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn, Level};
 
-#[derive(Parser)]
+#[derive(clap::Parser)]
 struct Args {
     /// Serial port assigned to LoRa receiver
     port: String,
@@ -20,126 +23,209 @@ struct Args {
     debug: bool,
 
     /// Define an output CSV file
-    #[arg(short, long, value_name = "FILE")]
-    output: Option<String>,
+    #[arg(short, long, value_name = "DIRECTORY")]
+    output: Option<std::path::PathBuf>,
 
     /// Launch WebSocket server for web panel
-    #[arg(
-        short,
-        long,
-        value_name = "ADDRESS",
-        default_missing_value = "127.0.0.1:3000"
-    )]
+    #[arg(short, long, value_name = "ADDRESS")]
     websocket: Option<String>,
 }
 
-#[derive(Debug, serde::Serialize)]
-struct Data([String; 22]);
+#[derive(Clone, Debug, serde::Serialize)]
+struct Data([isize; 23]);
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
 
-    let subscriber = tracing_subscriber::FmtSubscriber::builder()
-        .with_max_level(if args.debug {
-            Level::TRACE
-        } else {
-            Level::INFO
-        })
-        .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
-
-    let mut serial = tokio_serial::new(&args.port, 115200)
-        .data_bits(DataBits::Eight)
-        .parity(Parity::None)
-        .stop_bits(StopBits::One)
-        .open_native_async()?;
-
+    setup_tracing(args.debug)?;
+    let serial = Arc::new(Mutex::new(setup_serial(args.port)?));
     let mut writer = match args.output {
-        Some(ref path) => Some(
-            OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(path)
-                .await?,
-        ),
+        Some(ref output) => Some(setup_writer(output).await?),
         None => None,
     };
 
-    let (broadcast_tx, _broadcast_rx) = broadcast::channel(100);
+    serial
+        .clone()
+        .lock()
+        .await
+        .write_all(b"radio rx 0\r\n")
+        .await?;
 
-    if let Some(address) = args.websocket {
-        let ws_broadcast_tx = broadcast_tx.clone();
-        tokio::spawn(async move {
-            if let Err(e) = websocket(ws_broadcast_tx, &address).await {
-                error!("WebSocket server error: {}", e);
-            }
-        });
-    }
-    
-    serial.write_all(b"radio rx 0\r\n").await?;
-    
-    let broadcast_tx_clone = broadcast_tx.clone();
+    let (websocket_tx, _websocket_rx) = broadcast::channel::<String>(1024);
+    let tx_clone = websocket_tx.clone();
+    if let Some(address) = args.websocket.clone() {
+        setup_websocket(&address, tx_clone).await?;
+    };
+
+    let serial_clone = serial.clone();
+    let token = CancellationToken::new();
+    let child_token = token.child_token();
+
     let process = tokio::spawn(async move {
-        let mut reader = tokio::io::BufReader::new(&mut serial).lines();
-        let mut index = 0;
-        while let Ok(Some(line)) = reader.next_line().await {
-            match parse_line(&line) {
-                Ok(data) => {
-                    if let Some(ref mut file) = writer {
-                        if let Err(e) = write_csv(file, &data).await {
-                            error!("CSV write error: {}", e);
-                        }
-                    }
-
-                    if broadcast_tx_clone.receiver_count() > 0 {
-                        match serde_json::to_string(&data) {
-                            Ok(json_msg) => {
-                                let _ = broadcast_tx_clone.send(json_msg);
-                            }
-                            Err(e) => error!("JSON serialization error: {}", e),
-                        }
-                    }
-                    info!("{}: {:?}", index, data);
-                    index += 1;
+        let mut serial = serial_clone.lock().await;
+        let mut reader = tokio::io::BufReader::new(&mut *serial).lines();
+        let mut index: usize = 0;
+        loop {
+            tokio::select! {
+                _ = child_token.cancelled() => break,
+                Ok(Some(line)) = reader.next_line() => {
+                    let data = match parse_line(line) {
+                Ok(data) => data,
+                Err(error) => {
+                    warn!("{error}");
+                    continue;
                 }
-                Err(e) => {
-                    tracing::warn!("Parse error for line {}: {}", line, e);
+            };
+            if let Some(writer) = &mut writer {
+                if let Err(error) = write_csv(writer, &data).await {
+                    error!("{error}");
+                    continue;
+                }
+            };
+            if args.websocket.is_some() {
+                match serde_json::to_string(&data) {
+                    Ok(data) => {
+                        if let Err(error) = websocket_tx.send(data) {
+                            error!("{error}");
+                        }
+                    }
+                    Err(error) => error!("{error}"),
+                };
+            }
+            info!("{index} {data:?}");
+            index += 1;
                 }
             }
         }
-        Ok::<(), anyhow::Error>(())
     });
-    
+
     tokio::select! {
         _ = process => {},
         _ = tokio::signal::ctrl_c() => {
             info!("Shutting down...");
+            token.cancel();
+            serial
+                .clone()
+                .lock()
+                .await
+                .write_all(b"radio rxstop\r\n")
+                .await?;
         }
     }
     Ok(())
 }
 
-/// Parses a given line from the serial port into a Data struct.
-/// The line is expected to contain two whitespace‐separated parts,
-/// with the second being a hexadecimal string to decode.
-fn parse_line(line: &str) -> anyhow::Result<Data> {
-    let parts: Vec<&str> = line.split_whitespace().collect();
-    if parts.len() != 2 {
-        anyhow::bail!("This line does not contain data");
-    }
-    let decoded = hex::decode(parts[1])?;
-    let data_str = String::from_utf8(decoded)?;
-    let mut data_arr = [const { String::new() }; 22];
-    // Zip over the array and the whitespace‑split decoded string.
-    for (dst, src) in data_arr.iter_mut().zip(data_str.split_whitespace()) {
-        *dst = src.to_string();
-    }
-    Ok(Data(data_arr))
+/// Sets up a tracing subscriber and sets it as default for logging.
+/// A boolean is provided for enabling debug logging.
+fn setup_tracing(debug: bool) -> anyhow::Result<()> {
+    let subscriber = tracing_subscriber::FmtSubscriber::builder()
+        .with_max_level(if debug { Level::TRACE } else { Level::INFO })
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)?;
+    Ok(())
 }
 
-/// Serializes Data and writes it as CSV to the given file.
-async fn write_csv(writer: &mut tokio::fs::File, data: &Data) -> anyhow::Result<()> {
+/// Opens a serial connection on the provided serial port.
+fn setup_serial(port: String) -> anyhow::Result<SerialStream> {
+    let serial = tokio_serial::new(port, 115200)
+        .data_bits(tokio_serial::DataBits::Eight)
+        .parity(tokio_serial::Parity::None)
+        .stop_bits(tokio_serial::StopBits::One)
+        .open_native_async()?;
+    Ok(serial)
+}
+
+/// Creates a WebSocket server and starts accepting connections
+async fn setup_websocket(address: &String, tx: Sender<String>) -> anyhow::Result<()> {
+    let listener = tokio::net::TcpListener::bind(&address).await?;
+    info!("Websocket listening on ws://{}", address);
+    while let Ok((stream, _)) = listener.accept().await {
+        let peer = match stream.peer_addr() {
+            Ok(peer) => peer,
+            Err(error) => {
+                error!("{error}");
+                continue;
+            }
+        };
+        debug!("{} initiated connection to WebSocket server...", peer);
+        tokio::spawn(accept_connection(peer, stream, tx.subscribe()));
+    }
+    Ok(())
+}
+
+/// Accepts a WebSocket connection and starts sending messages to the client.
+async fn accept_connection(
+    peer: SocketAddr,
+    stream: TcpStream,
+    rx: Receiver<String>,
+) -> anyhow::Result<()> {
+    handle_connection(peer, stream, rx).await?;
+    Ok(())
+}
+
+/// Sends messages to the WebSocket client.
+async fn handle_connection(
+    peer: SocketAddr,
+    stream: TcpStream,
+    mut rx: Receiver<String>,
+) -> anyhow::Result<()> {
+    let ws_stream = accept_async(stream).await?;
+    debug!("{peer} connected via WebSocket");
+    let (mut ws_sender, _ws_receiver) = ws_stream.split();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(data) => {
+                    ws_sender
+                        .send(Message::from(data))
+                        .await
+                        .map_err(|error| error!("{error}"))
+                        .unwrap();
+                }
+                Err(error) => error!("{error}"),
+            }
+        }
+    });
+    Ok(())
+}
+
+/// Creates a file writer for writing CSV data to the given file.
+async fn setup_writer(
+    file: &std::path::Path,
+) -> anyhow::Result<tokio::io::BufWriter<tokio::fs::File>> {
+    let writer = tokio::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .open(file)
+        .await?;
+    let writer = tokio::io::BufWriter::new(writer);
+    Ok(writer)
+}
+
+/// Parses a line from WLR089 LoRa module by extracting the message,
+/// converting the HEX to UTF-8, and splitting the data into an array of integers.
+fn parse_line(line: String) -> anyhow::Result<Data> {
+    let parts: Vec<&str> = line.split_whitespace().collect();
+    if parts.len() != 2 {
+        debug!("Unexpected line: {line}");
+        bail!("Unexpected line");
+    }
+    let data_bytes = hex::decode(parts[1])?;
+    let data_str = String::from_utf8(data_bytes)?;
+
+    let mut data_array: [isize; 23] = [0; 23];
+    for (index, value) in data_str.split_whitespace().enumerate() {
+        data_array[index] = value.parse()?;
+    }
+    Ok(Data(data_array))
+}
+
+/// Writes a line to the writer in CSV format.
+async fn write_csv(
+    writer: &mut tokio::io::BufWriter<tokio::fs::File>,
+    data: &Data,
+) -> anyhow::Result<()> {
     let mut wtr = csv::WriterBuilder::new()
         .has_headers(false)
         .from_writer(vec![]);
@@ -147,51 +233,4 @@ async fn write_csv(writer: &mut tokio::fs::File, data: &Data) -> anyhow::Result<
     let bytes = wtr.into_inner()?;
     writer.write_all(&bytes).await?;
     Ok(())
-}
-
-/// Launches a simple WebSocket server.
-/// For every new connection, a subscription to the broadcast channel is created;
-/// messages received on the channel are sent to the client.
-async fn websocket(
-    broadcast_tx: broadcast::Sender<String>,
-    address: &String,
-) -> anyhow::Result<()> {
-    let listener = TcpListener::bind(address).await?;
-    info!("WebSocket server listening on ws://{}", address);
-
-    loop {
-        let (stream, peer_addr) = listener.accept().await?;
-        info!("New WebSocket connection from {}", peer_addr);
-        let tx = broadcast_tx.clone();
-        tokio::spawn(async move {
-            let mut ws_stream = match accept_async(stream).await {
-                Ok(ws_stream) => ws_stream,
-                Err(error) => {
-                    error!("WebSocket handshake error: {error}");
-                    return;
-                }
-            };
-            
-            let mut rx = tx.subscribe();
-            loop {
-                match rx.recv().await {
-                    Ok(msg) => {
-                        if ws_stream
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                Utf8Bytes::from(msg),
-                            ))
-                            .await
-                            .is_err()
-                        {
-                            info!("Client {} disconnected", peer_addr);
-                            break;
-                        }
-                    }
-                    
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
 }
