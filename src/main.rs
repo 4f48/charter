@@ -42,9 +42,10 @@ fn main() -> Result<(), MainError> {
     info!("Starting charter on {}...", args.port);
 
     let mut serial = initialize_serial(&args.port)?;
+    let mut serial_clone = serial.try_clone().unwrap();
     serial.write_all(b"radio rxstop")?;
     serial.write_all(b"radio rx 0")?;
-    let mut reader = std::io::BufReader::new(&mut serial).lines();
+    let mut reader = std::io::BufReader::new(serial);
 
     let mut writer = match args.output {
         Some(ref path) => Some(configure_writer(path)?),
@@ -54,15 +55,13 @@ fn main() -> Result<(), MainError> {
     let websocket = initialize_websocket(&running, &args)?;
 
     while running.load(Ordering::SeqCst) {
-        let line = match reader.next() {
-            Some(line) => match line {
-                Ok(line) => line,
-                Err(error) => {
-                    error!("{error}");
-                    continue;
-                }
+        let mut line = String::new();
+        match reader.read_line(&mut line) {
+            Ok(_) => (),
+            Err(error) => {
+                error!("{error}");
+                continue
             },
-            None => continue,
         };
         let data = match parse_line(line) {
             Ok(data) => data,
@@ -106,7 +105,7 @@ fn main() -> Result<(), MainError> {
     }
 
     info!("Stopping charter...");
-    serial.write_all(b"radio rxstop")?;
+    serial_clone.write_all(b"radio rxstop")?;
     Ok(())
 }
 
@@ -177,7 +176,7 @@ fn initialize_serial(port: &String) -> Result<Box<dyn serialport::SerialPort>, s
         .data_bits(serialport::DataBits::Eight)
         .parity(serialport::Parity::None)
         .stop_bits(serialport::StopBits::One)
-        .timeout(std::time::Duration::from_millis(3000))
+        .timeout(std::time::Duration::from_secs(1))
         .open()?)
 }
 
