@@ -1,0 +1,32 @@
+@import 'tailwindcss';
+@import '../node_modules/ol/ol.css';
+
+@font-face {
+	font-family: 'JetBrains Mono';
+	src: url('/fonts/JetBrainsMono-Regular.woff2') format('woff');
+	font-weight: normal;
+	font-style: normal;
+	font-display: swap;
+}
+
+@theme {
+	--color-bg: #fbf1c7;
+	--color-fg: #3c3836;
+	--color-border: #bdae93;
+	--color-surface: #ebdbb2;
+	--font-mono: 'JetBrains Mono', 'mono';
+}
+
+@layer base {
+	* {
+		color: var(--color-fg);
+		font-family: 'JetBrains Mono', monospace;
+		font-size: var(--text-base);
+	}
+
+	#map li,
+	#map a {
+		font-family: sans-serif;
+		font-size: var(--text-sm);
+	}
+}
